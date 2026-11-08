@@ -6,9 +6,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-08, tested on hardware
+
 Review of both drivers against current ESP-IDF practice and the DS18B20 datasheet. Built with
 ESP-IDF 5.5.1 for ESP32, ESP32-S3 and ESP32-C3 without warnings (also with `-Wextra -Werror`).
-Not yet tested on hardware.
+Tested on ESP32-S3 (ESP-IDF 5.5.4) in solar-heater-hap: two externally powered DS18B20 probes
+(95 cm cable) on separate pins with the internal pull-ups, both converting at the same time —
+stable readings, fast response to warming. The ESP8266_RTOS_SDK, ESP-IDF 4.x and esp-open-rtos
+paths are kept but were not built.
 
 ### Added
 - ESP-IDF 4.x / 5.x support for all ESP32 chips next to ESP8266_RTOS_SDK and esp-open-rtos:

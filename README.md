@@ -10,8 +10,8 @@ other 12-bit parts, DS18S20) for ESP chips.
 > come from Dallas Semiconductor / Maxim. The original copyright notices are kept in
 > [LICENSE](LICENSE).
 
-**Version:** 0.1.0 — the port for ESP8266_RTOS_SDK, used in practice. The changes since then
-(below) are in [Changelog.md](Changelog.md) under *Unreleased* until they are tested on hardware.
+**Version:** 0.2.0 — tested on hardware: ESP32-S3 (ESP-IDF 5.5.4), two externally powered DS18B20 on
+separate pins with the internal pull-ups, in solar-heater-hap. See [Changelog.md](Changelog.md).
 
 ## Platforms
 

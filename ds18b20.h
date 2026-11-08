@@ -21,6 +21,8 @@ extern "C" {
  *  conversion with read time slots (datasheet) instead of always waiting 750 ms.
  */
 
+#define DS18B20_VERSION "0.2.0"
+
 typedef onewire_addr_t ds18b20_addr_t;
 
 /** An address value which can be used to indicate "any device on the bus" */
