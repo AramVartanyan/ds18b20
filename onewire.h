@@ -1,8 +1,19 @@
 #ifndef __ONEWIRE_H__
 #define __ONEWIRE_H__
 
-//#include <esp_misc.h> // sdk_os_delay_us
-#include "FreeRTOS.h"
+/*
+ * 1-Wire bus master, one GPIO per bus. ESP-IDF 4.x / 5.x (all ESP32 chips), ESP8266_RTOS_SDK
+ * and esp-open-rtos. Based on esp-open-rtos extras/onewire and the Arduino OneWire library;
+ * see onewire.c and LICENSE for the authors.
+ *
+ * The bus needs a pull-up resistor (4.7 kOhm to the MCU logic level, DS18B20 datasheet). The
+ * internal pull-up (CONFIG_ONEWIRE_INTERNAL_PULLUP) is enough only for short wires.
+ * A bus (pin) must be used from one task at a time.
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +96,25 @@ bool onewire_skip_rom(int pin);
  */
 bool onewire_write(int pin, uint8_t v);
 
+/** Write a byte and drive the bus high (strong pull-up) right after its last bit.
+ *
+ *  For parasite-powered devices: the DS18B20 needs the strong pull-up within 10 us after a
+ *  Convert T or Copy Scratchpad command. The last bit and the switch to push-pull run in one
+ *  critical section. The bus stays driven until onewire_depower() or the next onewire_reset().
+ *
+ *  @returns `true` if successful, `false` on error.
+ */
+bool onewire_write_power(int pin, uint8_t v);
+
+/** Read one bit (one read time slot).
+ *
+ *  Used e.g. after Convert T to an externally powered DS18B20: it answers 0 while converting and
+ *  1 when done, or after Read Power Supply.
+ *
+ *  @returns 0 or 1, negative value on error (bus held low).
+ */
+int onewire_read_bit(int pin);
+
 /** Write multiple bytes on the 1-Wire bus.
  *
  *  See onewire_write() for more info.
@@ -128,7 +158,7 @@ bool onewire_read_bytes(int pin, uint8_t *buf, size_t count);
  *  onewire_reset() is called to start another command.
  *
  *  Note: Make sure the device(s) you are powering will not pull more current
- *  than the ESP8266 is able to supply via its GPIO pins (this is especially
+ *  than the GPIO is able to supply (this is especially
  *  important when multiple devices are on the same bus and they are all
  *  performing a power-intensive operation at the same time (i.e. multiple
  *  DS18B20 sensors, which have all been given a "convert T" operation by using
@@ -136,8 +166,7 @@ bool onewire_read_bytes(int pin, uint8_t *buf, size_t count);
  *
  *  Note: This routine will check to make sure that the bus is already high
  *  before driving it, to make sure it doesn't attempt to drive it high while
- *  something else is pulling it low (which could cause a reset or damage the
- *  ESP8266).
+ *  something else is pulling it low (which could damage the GPIO).
  *
  *  @param pin    The GPIO pin connected to the 1-Wire bus.
  *

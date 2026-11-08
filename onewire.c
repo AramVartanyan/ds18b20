@@ -1,60 +1,150 @@
-//for ESP8266_RTOS_SDK v 3.3.1rc
+/*
+ * 1-Wire bus master (bit-banged on one GPIO per bus).
+ *
+ * Origin: esp-open-rtos extras/onewire (MIT, (c) 2014 zeroday nodemcu.com), itself based on the
+ * Arduino OneWire library (Jim Studt, Paul Stoffregen and many contributors). Search algorithm and
+ * CRC8 table: Dallas Semiconductor / Maxim (portions (C) 2000 Dallas Semiconductor Corporation,
+ * see LICENSE). Updated for ESP-IDF 4.x / 5.x and ESP8266_RTOS_SDK by Aram Vartanyan, 2026.
+ *
+ * Timing follows the DS18B20 datasheet (AC characteristics) with the standard values of
+ * Maxim application note 126:
+ *   reset:    low 480 us, release, sample presence at 70 us, then 410 us more (tRSTH >= 480 us)
+ *   write 1:  low 6 us, high 64 us (tLOW1 1..15 us, tSLOT 60..120 us)
+ *   write 0:  low 60 us, high 10 us (tLOW0 60..120 us, tREC >= 1 us)
+ *   read:     low 3 us, release, sample 10 us later (< 15 us, tRDV), high 55 us
+ * Interrupts are disabled only inside one time slot (<= 70 us), never for a whole byte.
+ */
 
+#include <string.h>
 #include "onewire.h"
-#include "string.h"
-#include "task.h"
+
+/* ------------------------------------------------------------- platform */
+
+#ifdef ESP_PLATFORM
+/* ESP-IDF (all ESP32 chips) and ESP8266_RTOS_SDK: both define ESP_PLATFORM */
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/gpio.h"
+
+#if CONFIG_IDF_TARGET_ESP8266
+#include "rom/ets_sys.h"
+#define OW_DELAY_US(us)     ets_delay_us(us)
+#define OW_ENTER_CRITICAL() taskENTER_CRITICAL()
+#define OW_EXIT_CRITICAL()  taskEXIT_CRITICAL()
+#define OW_MODE_OD          GPIO_MODE_OUTPUT_OD     /* the ESP8266 reads an output pin as well */
+#define OW_MODE_PP          GPIO_MODE_OUTPUT
+#else
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 3, 0)
+#include "esp_rom_sys.h"
+#define OW_DELAY_US(us)     esp_rom_delay_us(us)
+#else
+#include "esp32/rom/ets_sys.h"
+#define OW_DELAY_US(us)     ets_delay_us(us)
+#endif
+static portMUX_TYPE s_ow_mux = portMUX_INITIALIZER_UNLOCKED;
+#define OW_ENTER_CRITICAL() portENTER_CRITICAL(&s_ow_mux)
+#define OW_EXIT_CRITICAL()  portEXIT_CRITICAL(&s_ow_mux)
+/* ESP32 chips read a pin only with its input enabled */
+#define OW_MODE_OD          GPIO_MODE_INPUT_OUTPUT_OD
+#define OW_MODE_PP          GPIO_MODE_INPUT_OUTPUT
+#endif
+
+#define OW_READ(pin)        gpio_get_level((gpio_num_t)(pin))
+#define OW_WRITE(pin, v)    gpio_set_level((gpio_num_t)(pin), (v))
+
+#ifndef CONFIG_ONEWIRE_INTERNAL_PULLUP
+#define CONFIG_ONEWIRE_INTERNAL_PULLUP 0
+#endif
+
+/* Configured once per pin (gpio_config() logs every call on ESP-IDF); afterwards only the
+ * direction changes between open drain (bus) and push-pull (strong pull-up). */
+static uint64_t s_configured;
+
+static void ow_pin_od(int pin)
+{
+    if (!(s_configured & (1ULL << pin))) {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << pin,
+            .mode = OW_MODE_OD,
+            .pull_up_en = CONFIG_ONEWIRE_INTERNAL_PULLUP ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        OW_WRITE(pin, 1);
+        gpio_config(&io);
+        s_configured |= 1ULL << pin;
+    } else {
+        gpio_set_direction((gpio_num_t)pin, OW_MODE_OD);
+    }
+    OW_WRITE(pin, 1);
+}
+
+static void ow_pin_pp(int pin)
+{
+    OW_WRITE(pin, 1);
+    gpio_set_direction((gpio_num_t)pin, OW_MODE_PP);
+}
+
+#else
+/* esp-open-rtos */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "esp/gpio.h"
+#include "espressif/esp_misc.h"
+#define OW_DELAY_US(us)     sdk_os_delay_us(us)
+#define OW_ENTER_CRITICAL() taskENTER_CRITICAL()
+#define OW_EXIT_CRITICAL()  taskEXIT_CRITICAL()
+#define OW_READ(pin)        gpio_read(pin)
+#define OW_WRITE(pin, v)    gpio_write((pin), (v))
+
+static void ow_pin_od(int pin)
+{
+    gpio_enable(pin, GPIO_OUT_OPEN_DRAIN);
+    gpio_write(pin, 1);
+}
+
+static void ow_pin_pp(int pin)
+{
+    gpio_write(pin, 1);
+    gpio_enable(pin, GPIO_OUTPUT);
+}
+#endif
+
+/* ----------------------------------------------------------------- timing */
 
 #define ONEWIRE_SELECT_ROM 0x55
 #define ONEWIRE_SKIP_ROM   0xcc
 #define ONEWIRE_SEARCH     0xf0
 
-#define GPIO_OUTPUT 00
-#define GPIO_OUT_OPEN_DRAIN 01
-
-extern volatile long countdelay = 0;
-
-
-void delay_100us(int count) {
-    countdelay = count;
-    while (countdelay) {};
-}
-
-void gpio_enable(uint32_t pin, int mode_pin)
-{
-
-    gpio_config_t io_conf;
-    io_conf.pin_bit_mask = (1ULL << pin);
-
-    if (mode_pin == GPIO_OUT_OPEN_DRAIN)
-    {
-        io_conf.pull_up_en = 0;
-        io_conf.mode = GPIO_MODE_OUTPUT_OD;
-    }
-    else
-    {
-        io_conf.pull_up_en = 0;
-        io_conf.mode = GPIO_MODE_DEF_OUTPUT;
-    }
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io_conf);
-}
+#define T_RESET_LOW     480     /* tRSTL >= 480 us */
+#define T_PRESENCE      70      /* sample the presence pulse (tPDHIGH 15..60 + tPDLOW 60..240) */
+#define T_RESET_REST    410     /* rest of tRSTH >= 480 us */
+#define T_W1_LOW        6       /* tLOW1 1..15 us: short, so a weak pull-up still has time */
+#define T_W1_HIGH       64
+#define T_W0_LOW        60      /* tLOW0 60..120 us */
+#define T_W0_HIGH       10
+#define T_R_LOW         3       /* > 1 us, as short as possible (datasheet fig. 18) */
+#define T_R_SAMPLE      10      /* sample before 15 us from the falling edge (tRDV) */
+#define T_R_REST        55
 
 // Waits up to `max_wait` microseconds for the specified pin to go high.
 // Returns true if successful, false if the bus never comes high (likely
 // shorted).
-static inline bool
-_onewire_wait_for_bus(int pin, int max_wait)
+static inline bool _onewire_wait_for_bus(int pin, int max_wait)
 {
     bool state;
     for (int i = 0; i < ((max_wait + 4) / 5); i++) {
-        if (gpio_get_level(pin)) break;
-        os_delay_us(5);
+        if (OW_READ(pin)) {
+            break;
+        }
+        OW_DELAY_US(5);
     }
-    state = gpio_get_level(pin);
+    state = OW_READ(pin);
     // Wait an extra 1us to make sure the devices have an adequate recovery
-    // time before we drive things low again.
-    os_delay_us(1);
+    // time (tREC) before we drive things low again.
+    OW_DELAY_US(1);
     return state;
 }
 
@@ -64,76 +154,86 @@ _onewire_wait_for_bus(int pin, int max_wait)
 //
 // Returns true if a device asserted a presence pulse, false otherwise.
 //
-bool onewire_reset(int pin) {
+bool onewire_reset(int pin)
+{
     bool r;
 
-    gpio_enable(pin, GPIO_OUT_OPEN_DRAIN);
-    gpio_set_level(pin, 1);
+    ow_pin_od(pin);
     // wait until the wire is high... just in case
-    if (!_onewire_wait_for_bus(pin, 250)) return false;
+    if (!_onewire_wait_for_bus(pin, 250)) {
+        return false;
+    }
 
-    gpio_set_level(pin, 0);
-    //delay_100us(3);
-    os_delay_us(480);
+    OW_WRITE(pin, 0);
+    OW_DELAY_US(T_RESET_LOW);   // longer is harmless (no parasite power at > 960 us here)
 
-    taskENTER_CRITICAL();
-    gpio_set_level(pin, 1); // allow it to float
-    os_delay_us(70);
-    r = !gpio_get_level(pin);
-    taskEXIT_CRITICAL();
+    OW_ENTER_CRITICAL();
+    OW_WRITE(pin, 1);           // allow it to float
+    OW_DELAY_US(T_PRESENCE);
+    r = !OW_READ(pin);
+    OW_EXIT_CRITICAL();
 
-    // Wait for all devices to finish pulling the bus low before returning
-    if (!_onewire_wait_for_bus(pin, 410)) return false;
-
+    // complete tRSTH: the devices end their presence pulse within 300 us
+    OW_DELAY_US(T_RESET_REST);
+    if (!_onewire_wait_for_bus(pin, 10)) {
+        return false;
+    }
     return r;
 }
 
-static bool _onewire_write_bit(int pin, bool v) {
-    if (!_onewire_wait_for_bus(pin, 10)) return false;
-    if (v) {
-        taskENTER_CRITICAL();
-        gpio_set_level(pin, 0);  // drive output low
-        os_delay_us(10);
-        gpio_set_level(pin, 1);  // allow output high
-        taskEXIT_CRITICAL();
-        os_delay_us(55);
-    } else {
-        taskENTER_CRITICAL();
-        gpio_set_level(pin, 0);  // drive output low
-        os_delay_us(65);
-        gpio_set_level(pin, 1); // allow output high
-        taskEXIT_CRITICAL();
+static bool _onewire_write_bit(int pin, bool v)
+{
+    if (!_onewire_wait_for_bus(pin, 10)) {
+        return false;
     }
-    os_delay_us(1);
-
+    OW_ENTER_CRITICAL();
+    OW_WRITE(pin, 0);           // drive output low
+    if (v) {
+        OW_DELAY_US(T_W1_LOW);
+        OW_WRITE(pin, 1);       // allow output high
+        OW_EXIT_CRITICAL();
+        OW_DELAY_US(T_W1_HIGH);
+    } else {
+        OW_DELAY_US(T_W0_LOW);
+        OW_WRITE(pin, 1);       // allow output high
+        OW_EXIT_CRITICAL();
+        OW_DELAY_US(T_W0_HIGH);
+    }
     return true;
 }
 
-static int _onewire_read_bit(int pin) {
+static int _onewire_read_bit(int pin)
+{
     int r;
 
-    if (!_onewire_wait_for_bus(pin, 10)) return -1;
-    taskENTER_CRITICAL();
-    gpio_set_level(pin, 0);
-    os_delay_us(2);
-    gpio_set_level(pin, 1);  // let pin float, pull up will raise
-    os_delay_us(11);
-    r = gpio_get_level(pin);  // Must sample within 15us of start
-    taskEXIT_CRITICAL();
-    os_delay_us(48);
+    if (!_onewire_wait_for_bus(pin, 10)) {
+        return -1;
+    }
+    OW_ENTER_CRITICAL();
+    OW_WRITE(pin, 0);
+    OW_DELAY_US(T_R_LOW);
+    OW_WRITE(pin, 1);           // let pin float, pull up will raise
+    OW_DELAY_US(T_R_SAMPLE);
+    r = OW_READ(pin);           // must sample within 15us of start
+    OW_EXIT_CRITICAL();
+    OW_DELAY_US(T_R_REST);
 
     return r;
+}
+
+int onewire_read_bit(int pin)
+{
+    return _onewire_read_bit(pin);
 }
 
 // Write a byte. The writing code uses open-drain mode and expects the pullup
 // resistor to pull the line high when not driven low.  If you need strong
 // power after the write (e.g. DS18B20 in parasite power mode) then call
-// onewire_power() after this is complete to actively drive the line high.
+// onewire_write_power() instead.
 //
-bool onewire_write(int pin, uint8_t v) {
-    uint8_t bitMask;
-
-    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
+bool onewire_write(int pin, uint8_t v)
+{
+    for (uint8_t bitMask = 0x01; bitMask; bitMask <<= 1) {
         if (!_onewire_write_bit(pin, (bitMask & v))) {
             return false;
         }
@@ -141,10 +241,31 @@ bool onewire_write(int pin, uint8_t v) {
     return true;
 }
 
-bool onewire_write_bytes(int pin, const uint8_t *buf, size_t count) {
-    size_t i;
+bool onewire_write_power(int pin, uint8_t v)
+{
+    for (uint8_t bitMask = 0x01; bitMask != 0x80; bitMask <<= 1) {
+        if (!_onewire_write_bit(pin, (bitMask & v))) {
+            return false;
+        }
+    }
+    // last bit and strong pull-up in one critical section: the bus is driven high right at the
+    // end of the slot (datasheet: within 10 us after the command)
+    if (!_onewire_wait_for_bus(pin, 10)) {
+        return false;
+    }
+    bool last = v & 0x80;
+    OW_ENTER_CRITICAL();
+    OW_WRITE(pin, 0);
+    OW_DELAY_US(last ? T_W1_LOW : T_W0_LOW);
+    OW_WRITE(pin, 1);
+    ow_pin_pp(pin);
+    OW_EXIT_CRITICAL();
+    return true;
+}
 
-    for (i = 0; i < count; i++) {
+bool onewire_write_bytes(int pin, const uint8_t *buf, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
         if (!onewire_write(pin, buf[i])) {
             return false;
         }
@@ -154,13 +275,12 @@ bool onewire_write_bytes(int pin, const uint8_t *buf, size_t count) {
 
 // Read a byte
 //
-int onewire_read(int pin) {
-    uint8_t bitMask;
+int onewire_read(int pin)
+{
     int r = 0;
-    int bit;
 
-    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
-        bit = _onewire_read_bit(pin);
+    for (uint8_t bitMask = 0x01; bitMask; bitMask <<= 1) {
+        int bit = _onewire_read_bit(pin);
         if (bit < 0) {
             return -1;
         } else if (bit) {
@@ -170,64 +290,63 @@ int onewire_read(int pin) {
     return r;
 }
 
-bool onewire_read_bytes(int pin, uint8_t *buf, size_t count) {
-    size_t i;
-    int b;
-
-    for (i = 0; i < count; i++) {
-        b = onewire_read(pin);
-        if (b < 0) return false;
+bool onewire_read_bytes(int pin, uint8_t *buf, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        int b = onewire_read(pin);
+        if (b < 0) {
+            return false;
+        }
         buf[i] = b;
     }
     return true;
 }
 
-bool onewire_select(int pin, onewire_addr_t addr) {
-    uint8_t i;
-
+bool onewire_select(int pin, onewire_addr_t addr)
+{
     if (!onewire_write(pin, ONEWIRE_SELECT_ROM)) {
         return false;
     }
-
-    for (i = 0; i < 8; i++) {
+    for (uint8_t i = 0; i < 8; i++) {
         if (!onewire_write(pin, addr & 0xff)) {
             return false;
         }
         addr >>= 8;
     }
-
     return true;
 }
 
-bool onewire_skip_rom(int pin) {
+bool onewire_skip_rom(int pin)
+{
     return onewire_write(pin, ONEWIRE_SKIP_ROM);
 }
 
-bool onewire_power(int pin) {
+bool onewire_power(int pin)
+{
     // Make sure the bus is not being held low before driving it high, or we
     // may end up shorting ourselves out.
-    if (!_onewire_wait_for_bus(pin, 10)) return false;
-
-    gpio_enable(pin, GPIO_OUTPUT);
-    gpio_set_level(pin, 1);
-
+    if (!_onewire_wait_for_bus(pin, 10)) {
+        return false;
+    }
+    ow_pin_pp(pin);
     return true;
 }
 
-void onewire_depower(int pin) {
-    gpio_enable(pin, GPIO_OUT_OPEN_DRAIN);
+void onewire_depower(int pin)
+{
+    ow_pin_od(pin);
 }
 
-void onewire_search_start(onewire_search_t *search) {
+void onewire_search_start(onewire_search_t *search)
+{
     // reset the search state
     memset(search, 0, sizeof(*search));
 }
 
-void onewire_search_prefix(onewire_search_t *search, uint8_t family_code) {
-    uint8_t i;
-
+void onewire_search_prefix(onewire_search_t *search, uint8_t family_code)
+{
     search->rom_no[0] = family_code;
-    for (i = 1; i < 8; i++) {
+    for (uint8_t i = 1; i < 8; i++) {
         search->rom_no[i] = 0;
     }
     search->last_discrepancy = 64;
@@ -237,18 +356,16 @@ void onewire_search_prefix(onewire_search_t *search, uint8_t family_code) {
 // Perform a search. If the next device has been successfully enumerated, its
 // ROM address will be returned.  If there are no devices, no further
 // devices, or something horrible happens in the middle of the
-// enumeration then ONEWIRE_NONE is returned.  Use OneWire::reset_search() to
+// enumeration then ONEWIRE_NONE is returned.  Use onewire_search_start() to
 // start over.
 //
 // --- Replaced by the one from the Dallas Semiconductor web site ---
 //--------------------------------------------------------------------------
 // Perform the 1-Wire Search Algorithm on the 1-Wire bus using the existing
 // search state.
-// Return 1 : device found, ROM number in ROM_NO buffer
-//        0 : device not found, end of search
 //
-onewire_addr_t onewire_search_next(onewire_search_t *search, int pin) {
-    //TODO: add more checking for read/write errors
+onewire_addr_t onewire_search_next(onewire_search_t *search, int pin)
+{
     uint8_t id_bit_number;
     uint8_t last_zero, search_result;
     int rom_byte_number;
@@ -263,19 +380,16 @@ onewire_addr_t onewire_search_next(onewire_search_t *search, int pin) {
     rom_byte_number = 0;
     rom_byte_mask = 1;
     search_result = 0;
-   
+
     // if the last call was not the last one
     if (!search->last_device_found) {
         // 1-Wire reset
-        if (!onewire_reset(pin)) {
+        if (!onewire_reset(pin) || !onewire_write(pin, ONEWIRE_SEARCH)) {
             // reset the search
             search->last_discrepancy = 0;
             search->last_device_found = false;
             return ONEWIRE_NONE;
         }
-
-        // issue the search command
-        onewire_write(pin, ONEWIRE_SEARCH);
 
         // loop to do the search
         do {
@@ -318,7 +432,9 @@ onewire_addr_t onewire_search_next(onewire_search_t *search, int pin) {
                 }
 
                 // serial number search direction write bit
-                _onewire_write_bit(pin, search_direction);
+                if (!_onewire_write_bit(pin, search_direction)) {
+                    break;
+                }
 
                 // increment the byte counter id_bit_number
                 // and shift the mask rom_byte_mask
@@ -347,17 +463,17 @@ onewire_addr_t onewire_search_next(onewire_search_t *search, int pin) {
         }
     }
 
-    // if no device found then reset counters so next 'search' will be like a first
-    if (!search_result || !search->rom_no[0]) {
+    // if no device found, or the ROM code is corrupted, reset counters so next 'search' will be
+    // like a first
+    if (!search_result || !search->rom_no[0] ||
+        onewire_crc8(search->rom_no, 7) != search->rom_no[7]) {
         search->last_discrepancy = 0;
         search->last_device_found = false;
         return ONEWIRE_NONE;
-    } else {
-        addr = 0;
-        for (rom_byte_number = 7; rom_byte_number >= 0; rom_byte_number--) {
-            addr = (addr << 8) | search->rom_no[rom_byte_number];
-        }
-        //printf("Ok I found something at %08x%08x...\n", (uint32_t)(addr >> 32), (uint32_t)addr);
+    }
+    addr = 0;
+    for (rom_byte_number = 7; rom_byte_number >= 0; rom_byte_number--) {
+        addr = (addr << 8) | search->rom_no[rom_byte_number];
     }
     return addr;
 }
@@ -387,22 +503,16 @@ static const uint8_t dscrc_table[] = {
     233,183, 85, 11,136,214, 52,106, 43,117,151,201, 74, 20,246,168,
     116, 42,200,150, 21, 75,169,247,182,232, 10, 84,215,137,107, 53};
 
-#ifndef pgm_read_byte
-#define pgm_read_byte(addr) (*(const uint8_t *)(addr))
-#endif
-
 //
 // Compute a Dallas Semiconductor 8 bit CRC. These show up in the ROM
-// and the registers.  (note: this might better be done without to
-// table, it would probably be smaller and certainly fast enough
-// compared to all those delayMicrosecond() calls.  But I got
-// confused, so I use this table from the examples.)
+// and the registers.
 //
-uint8_t onewire_crc8(const uint8_t *data, uint8_t len) {
+uint8_t onewire_crc8(const uint8_t *data, uint8_t len)
+{
     uint8_t crc = 0;
 
     while (len--) {
-        crc = pgm_read_byte(dscrc_table + (crc ^ *data++));
+        crc = dscrc_table[crc ^ *data++];
     }
     return crc;
 }
@@ -411,15 +521,18 @@ uint8_t onewire_crc8(const uint8_t *data, uint8_t len) {
 // Compute a Dallas Semiconductor 8 bit CRC directly.
 // this is much slower, but much smaller, than the lookup table.
 //
-uint8_t onewire_crc8(const uint8_t *data, uint8_t len) {
+uint8_t onewire_crc8(const uint8_t *data, uint8_t len)
+{
     uint8_t crc = 0;
-    
+
     while (len--) {
         uint8_t inbyte = *data++;
         for (int i = 8; i; i--) {
             uint8_t mix = (crc ^ inbyte) & 0x01;
             crc >>= 1;
-            if (mix) crc ^= 0x8C;
+            if (mix) {
+                crc ^= 0x8C;
+            }
             inbyte >>= 1;
         }
     }
@@ -428,26 +541,8 @@ uint8_t onewire_crc8(const uint8_t *data, uint8_t len) {
 #endif
 
 // Compute the 1-Wire CRC16 and compare it against the received CRC.
-// Example usage (reading a DS2408):
-//    // Put everything in a buffer so we can compute the CRC easily.
-//    uint8_t buf[13];
-//    buf[0] = 0xF0;    // Read PIO Registers
-//    buf[1] = 0x88;    // LSB address
-//    buf[2] = 0x00;    // MSB address
-//    WriteBytes(net, buf, 3);    // Write 3 cmd bytes
-//    ReadBytes(net, buf+3, 10);  // Read 6 data bytes, 2 0xFF, 2 CRC16
-//    if (!CheckCRC16(buf, 11, &buf[11])) {
-//        // Handle error.
-//    }
-//
-// @param input - Array of bytes to checksum.
-// @param len - How many bytes to use.
-// @param inverted_crc - The two CRC16 bytes in the received data.
-//                       This should just point into the received data,
-//                       *not* at a 16-bit integer.
-// @param crc - The crc starting value (optional)
-// @return 1, iff the CRC matches.
-bool onewire_check_crc16(const uint8_t* input, size_t len, const uint8_t* inverted_crc, uint16_t crc_iv) {
+bool onewire_check_crc16(const uint8_t *input, size_t len, const uint8_t *inverted_crc, uint16_t crc_iv)
+{
     uint16_t crc = ~onewire_crc16(input, len, crc_iv);
     return (crc & 0xFF) == inverted_crc[0] && (crc >> 8) == inverted_crc[1];
 }
@@ -460,30 +555,27 @@ bool onewire_check_crc16(const uint8_t* input, size_t len, const uint8_t* invert
 //   2) Depending on the endian-ness of your processor, the binary
 //      representation of the two-byte return value may have a different
 //      byte order than the two bytes you get from 1-Wire.
-// @param input - Array of bytes to checksum.
-// @param len - How many bytes to use.
-// @param crc - The crc starting value (optional)
-// @return The CRC16, as defined by Dallas Semiconductor.
-uint16_t onewire_crc16(const uint8_t* input, size_t len, uint16_t crc_iv) {
+uint16_t onewire_crc16(const uint8_t *input, size_t len, uint16_t crc_iv)
+{
     uint16_t crc = crc_iv;
     static const uint8_t oddparity[16] =
         { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 };
 
-    uint16_t i;
-    for (i = 0; i < len; i++) {
-      // Even though we're just copying a byte from the input,
-      // we'll be doing 16-bit computation with it.
-      uint16_t cdata = input[i];
-      cdata = (cdata ^ crc) & 0xff;
-      crc >>= 8;
+    for (size_t i = 0; i < len; i++) {
+        // Even though we're just copying a byte from the input,
+        // we'll be doing 16-bit computation with it.
+        uint16_t cdata = input[i];
+        cdata = (cdata ^ crc) & 0xff;
+        crc >>= 8;
 
-      if (oddparity[cdata & 0x0F] ^ oddparity[cdata >> 4])
-          crc ^= 0xC001;
+        if (oddparity[cdata & 0x0F] ^ oddparity[cdata >> 4]) {
+            crc ^= 0xC001;
+        }
 
-      cdata <<= 6;
-      crc ^= cdata;
-      cdata <<= 1;
-      crc ^= cdata;
+        cdata <<= 6;
+        crc ^= cdata;
+        cdata <<= 1;
+        crc ^= cdata;
     }
     return crc;
 }

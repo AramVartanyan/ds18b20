@@ -1,0 +1,21 @@
+menu "DS18B20 / 1-Wire"
+
+    config ONEWIRE_INTERNAL_PULLUP
+        bool "Enable the internal pull-up on the 1-Wire pins"
+        default n
+        help
+            The 1-Wire bus needs a pull-up resistor (4.7 kOhm to the MCU logic level, DS18B20
+            datasheet). The internal one (~45 kOhm on ESP32 chips) is enough only for short wires
+            and a development setup; with long sensor cables use the external resistor.
+
+    config DS18B20_POLL_CONVERSION
+        bool "Poll the end of the conversion (externally powered sensors)"
+        default y
+        help
+            An externally powered DS18B20 answers read time slots with 0 while converting and 1
+            when done (datasheet), so a measurement takes as long as the conversion really does
+            (typically less than 750 ms). Turn it off for sensors that do not support this
+            (some clones): the driver then always waits 750 ms. Parasite powered sensors always
+            get the full 750 ms with the strong pull-up.
+
+endmenu
